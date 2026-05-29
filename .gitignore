@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# App data (personal recordings & DB — not committed)
+recordings/
+*.db
+settings.json
+
+# macOS
+.DS_Store
+*.swp
+
+# Models cache (downloaded automatically on first run)
+.cache/
