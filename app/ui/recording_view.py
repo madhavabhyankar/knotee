@@ -6,12 +6,12 @@ from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QPainter, QColor, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QSizePolicy, QFrame,
+    QTextEdit, QSizePolicy, QFrame, QMessageBox,
 )
 
 from ..audio.recorder import AudioRecorder
 from ..transcription.worker import TranscriptionWorker
-from ..diarization.worker import DiarizationWorker
+from ..diarization.worker import DiarizationWorker, apply_diarization_to_meeting
 from ..storage import db
 from ..llm.client import is_ollama_available
 
@@ -226,19 +226,14 @@ class RecordingView(QWidget):
         self._transcript.append(f"<span style='color:#9ca3af;font-size:12px'>[{_fmt_sec(start)}]</span> {text}")
 
     def _on_diarization(self, turns: list) -> None:
-        segments = db.get_segments(self._meeting_id)
-        for seg in segments:
-            for turn in turns:
-                if turn["start"] <= seg.start_sec < turn["end"]:
-                    sp_id = db.get_or_create_speaker(self._meeting_id, turn["label"])
-                    db.assign_speaker_to_segment(seg.id, sp_id)
-                    break
+        apply_diarization_to_meeting(self._meeting_id, turns)
         self._set_status("Done")
         if self._meeting_id:
             self.recording_saved.emit(self._meeting_id)
 
     def _on_diarization_error(self, msg: str) -> None:
-        self._set_status(f"Speaker ID unavailable: {msg.split(':')[0]}")
+        self._set_status("Speaker detection failed")
+        QMessageBox.warning(self, "Speaker Detection Failed", msg)
         if self._meeting_id:
             self.recording_saved.emit(self._meeting_id)
 

@@ -16,6 +16,7 @@ from ..storage.models import Meeting, Segment
 from ..llm import client as llm
 from ..export.exporter import to_txt, to_pdf
 from ..audio.player import MeetingPlayer
+from ..diarization.worker import DiarizationWorker, apply_diarization_to_meeting
 
 
 class SpeakerPanel(QWidget):
@@ -108,6 +109,7 @@ class MeetingDetailView(QWidget):
         self._meeting_id = meeting_id
         self._settings = settings
         self._llm_thread: Optional[_LLMThread] = None
+        self._diarizer: Optional[DiarizationWorker] = None
         self._segment_ids: list[int] = []
         # sorted list of start_sec values — index matches transcript list row
         self._seg_starts: list[float] = []
@@ -210,6 +212,17 @@ class MeetingDetailView(QWidget):
         self._dur_label = QLabel("0:00")
         self._dur_label.setStyleSheet("font-size: 12px; color: #6b7280; font-family: monospace; min-width: 36px;")
         pb_layout.addWidget(self._dur_label)
+
+        self._detect_btn = QPushButton("⟳ Detect Speakers")
+        self._detect_btn.setFixedHeight(32)
+        self._detect_btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 0 12px; border-radius: 6px; "
+            "background: #ede9fe; color: #4338ca; border: none; }"
+            "QPushButton:hover { background: #ddd6fe; }"
+            "QPushButton:disabled { background: #f3f4f6; color: #9ca3af; }"
+        )
+        self._detect_btn.clicked.connect(self._run_diarization)
+        pb_layout.addWidget(self._detect_btn)
 
         self._playback_bar.setVisible(False)
         layout.addWidget(self._playback_bar)
@@ -389,6 +402,33 @@ class MeetingDetailView(QWidget):
         start = item.data(Qt.UserRole + 2)
         if start is not None:
             self._player.seek(float(start))
+
+    # ── Diarization (from detail view) ───────────────────────────────────────
+
+    def _run_diarization(self) -> None:
+        meeting = db.get_meeting(self._meeting_id)
+        if not meeting or not meeting.audio_path:
+            return
+        if self._diarizer and self._diarizer.isRunning():
+            return
+        self._detect_btn.setEnabled(False)
+        self._status_label.setText("Loading speaker model…")
+        self._diarizer = DiarizationWorker(meeting.audio_path)
+        self._diarizer.progress.connect(self._status_label.setText)
+        self._diarizer.diarization_complete.connect(self._on_diarization)
+        self._diarizer.error_occurred.connect(self._on_diarization_error)
+        self._diarizer.start()
+
+    def _on_diarization(self, turns: list) -> None:
+        apply_diarization_to_meeting(self._meeting_id, turns)
+        self._detect_btn.setEnabled(True)
+        self._status_label.setText("")
+        self.load()
+
+    def _on_diarization_error(self, msg: str) -> None:
+        self._detect_btn.setEnabled(True)
+        self._status_label.setText("Speaker detection failed")
+        QMessageBox.warning(self, "Speaker Detection Failed", msg)
 
     # ── Speaker assignment ────────────────────────────────────────────────────
 
