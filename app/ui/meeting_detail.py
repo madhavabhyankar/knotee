@@ -1,3 +1,5 @@
+import bisect
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -6,13 +8,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QListWidget, QListWidgetItem, QSplitter,
     QFrame, QFileDialog, QMessageBox, QInputDialog,
-    QMenu, QAbstractItemView, QWidgetAction,
+    QMenu, QAbstractItemView, QWidgetAction, QSlider,
 )
 
 from ..storage import db
 from ..storage.models import Meeting, Segment
 from ..llm import client as llm
 from ..export.exporter import to_txt, to_pdf
+from ..audio.player import MeetingPlayer
 
 
 class SpeakerPanel(QWidget):
@@ -105,7 +108,16 @@ class MeetingDetailView(QWidget):
         self._meeting_id = meeting_id
         self._settings = settings
         self._llm_thread: Optional[_LLMThread] = None
-        self._segment_ids: list[int] = []  # parallel to list widget rows
+        self._segment_ids: list[int] = []
+        # sorted list of start_sec values — index matches transcript list row
+        self._seg_starts: list[float] = []
+        self._seg_ends: list[float] = []
+        self._auto_scrolling = False   # guard to avoid feedback loops
+        self._slider_dragging = False
+        self._player = MeetingPlayer(self)
+        self._player.position_changed.connect(self._on_position)
+        self._player.duration_changed.connect(self._on_duration)
+        self._player.playback_state_changed.connect(self._on_state)
         self._build_ui()
         self.load()
 
@@ -114,6 +126,8 @@ class MeetingDetailView(QWidget):
 
     def refresh(self) -> None:
         self.load()
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -140,7 +154,7 @@ class MeetingDetailView(QWidget):
         sep.setStyleSheet("color: #e5e7eb;")
         layout.addWidget(sep)
 
-        # AI buttons — always visible; error shown if Ollama is not available
+        # AI buttons
         ai_row = QHBoxLayout()
         self._summary_btn = QPushButton("✦ Generate Summary")
         self._summary_btn.setStyleSheet(
@@ -158,10 +172,51 @@ class MeetingDetailView(QWidget):
         ai_row.addStretch()
         layout.addLayout(ai_row)
 
-        # Main splitter: left = transcript, right = speakers + summary
+        # ── Playback bar ──────────────────────────────────────────────────────
+        self._playback_bar = QWidget()
+        self._playback_bar.setStyleSheet(
+            "background: #f3f4f6; border-radius: 10px; padding: 0px;"
+        )
+        pb_layout = QHBoxLayout(self._playback_bar)
+        pb_layout.setContentsMargins(12, 8, 12, 8)
+        pb_layout.setSpacing(10)
+
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setFixedSize(36, 36)
+        self._play_btn.setStyleSheet(
+            "QPushButton { background: #4338ca; color: white; border-radius: 18px; "
+            "font-size: 14px; border: none; }"
+            "QPushButton:hover { background: #3730a3; }"
+        )
+        self._play_btn.clicked.connect(self._player.toggle)
+        pb_layout.addWidget(self._play_btn)
+
+        self._pos_label = QLabel("0:00")
+        self._pos_label.setStyleSheet("font-size: 12px; color: #6b7280; font-family: monospace; min-width: 36px;")
+        pb_layout.addWidget(self._pos_label)
+
+        self._seek_slider = QSlider(Qt.Horizontal)
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setStyleSheet(
+            "QSlider::groove:horizontal { height: 4px; background: #d1d5db; border-radius: 2px; }"
+            "QSlider::sub-page:horizontal { background: #4338ca; border-radius: 2px; }"
+            "QSlider::handle:horizontal { width: 14px; height: 14px; border-radius: 7px; "
+            "background: #4338ca; margin: -5px 0; }"
+        )
+        self._seek_slider.sliderPressed.connect(self._on_slider_pressed)
+        self._seek_slider.sliderReleased.connect(self._on_slider_released)
+        pb_layout.addWidget(self._seek_slider, stretch=1)
+
+        self._dur_label = QLabel("0:00")
+        self._dur_label.setStyleSheet("font-size: 12px; color: #6b7280; font-family: monospace; min-width: 36px;")
+        pb_layout.addWidget(self._dur_label)
+
+        self._playback_bar.setVisible(False)
+        layout.addWidget(self._playback_bar)
+
+        # ── Main splitter ─────────────────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
 
-        # Transcript as QListWidget for per-row context menu
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -181,10 +236,10 @@ class MeetingDetailView(QWidget):
         self._transcript_list.setWordWrap(True)
         self._transcript_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._transcript_list.customContextMenuRequested.connect(self._segment_context_menu)
+        self._transcript_list.itemClicked.connect(self._on_segment_clicked)
         left_layout.addWidget(self._transcript_list)
         splitter.addWidget(left)
 
-        # Right panel
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -229,6 +284,8 @@ class MeetingDetailView(QWidget):
         self._status_label.setStyleSheet("color: #9ca3af; font-size: 11px;")
         layout.addWidget(self._status_label)
 
+    # ── Load ──────────────────────────────────────────────────────────────────
+
     def load(self) -> None:
         meeting = db.get_meeting(self._meeting_id)
         if not meeting:
@@ -236,21 +293,26 @@ class MeetingDetailView(QWidget):
         self._title_label.setText(meeting.title)
         self._date_label.setText(meeting.started_at.strftime("%B %d, %Y  %H:%M"))
 
-        # Rebuild transcript list
+        # Rebuild transcript list and segment time index
         self._transcript_list.clear()
         self._segment_ids.clear()
+        self._seg_starts.clear()
+        self._seg_ends.clear()
+
         for seg in meeting.segments:
             speaker = seg.speaker_display or "Unknown"
             ts = _fmt_sec(seg.start_sec)
             item = QListWidgetItem(f"[{ts}]  {speaker}: {seg.text}")
             item.setData(Qt.UserRole, seg.id)
-            # colour the speaker label
+            item.setData(Qt.UserRole + 2, seg.start_sec)  # for click-to-seek
             if seg.speaker_display:
                 item.setForeground(Qt.black)
             else:
                 item.setForeground(Qt.gray)
             self._transcript_list.addItem(item)
             self._segment_ids.append(seg.id)
+            self._seg_starts.append(seg.start_sec)
+            self._seg_ends.append(seg.end_sec)
 
         self._speaker_panel.refresh()
 
@@ -259,7 +321,14 @@ class MeetingDetailView(QWidget):
         if meeting.action_items:
             self._actions_edit.setPlainText(meeting.action_items)
 
-        # Check Ollama asynchronously to avoid blocking the main thread
+        # Show/hide playback bar
+        audio_ok = bool(meeting.audio_path and Path(meeting.audio_path).exists())
+        self._playback_bar.setVisible(audio_ok)
+        if audio_ok:
+            self._player.stop()
+            self._player.load(meeting.audio_path)
+
+        # Ollama check
         ollama_url = self._settings.get("ollama_url", llm.DEFAULT_URL)
         if not llm.is_ollama_available(ollama_url):
             self._status_label.setText(
@@ -271,6 +340,55 @@ class MeetingDetailView(QWidget):
             self._status_label.setText("")
             self._summary_btn.setEnabled(True)
             self._actions_btn.setEnabled(True)
+
+    # ── Playback callbacks ────────────────────────────────────────────────────
+
+    def _on_position(self, secs: float) -> None:
+        if not self._slider_dragging:
+            self._seek_slider.setValue(int(secs * 10))
+        self._pos_label.setText(_fmt_sec(secs))
+        self._sync_transcript(secs)
+
+    def _on_duration(self, secs: float) -> None:
+        self._seek_slider.setRange(0, int(secs * 10))
+        self._dur_label.setText(_fmt_sec(secs))
+
+    def _on_state(self, playing: bool) -> None:
+        self._play_btn.setText("⏸" if playing else "▶")
+
+    def _on_slider_pressed(self) -> None:
+        self._slider_dragging = True
+
+    def _on_slider_released(self) -> None:
+        self._slider_dragging = False
+        self._player.seek(self._seek_slider.value() / 10.0)
+
+    def _sync_transcript(self, pos_sec: float) -> None:
+        if not self._seg_starts or not self._player.is_playing:
+            return
+        # find the last segment whose start_sec <= pos_sec
+        idx = bisect.bisect_right(self._seg_starts, pos_sec) - 1
+        if idx < 0:
+            return
+        # only highlight if pos is within this segment's end
+        if pos_sec > self._seg_ends[idx]:
+            return
+        current = self._transcript_list.currentRow()
+        if idx != current:
+            self._auto_scrolling = True
+            self._transcript_list.setCurrentRow(idx)
+            self._transcript_list.scrollToItem(
+                self._transcript_list.item(idx),
+                QAbstractItemView.PositionAtCenter,
+            )
+            self._auto_scrolling = False
+
+    def _on_segment_clicked(self, item: QListWidgetItem) -> None:
+        if self._auto_scrolling:
+            return
+        start = item.data(Qt.UserRole + 2)
+        if start is not None:
+            self._player.seek(float(start))
 
     # ── Speaker assignment ────────────────────────────────────────────────────
 
@@ -296,21 +414,11 @@ class MeetingDetailView(QWidget):
                 font-size: 13px;
                 color: #111827;
             }
-            QMenu::item:selected {
-                background: #ede9fe;
-                color: #4338ca;
-            }
-            QMenu::item:disabled {
-                color: #9ca3af;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #e5e7eb;
-                margin: 4px 8px;
-            }
+            QMenu::item:selected { background: #ede9fe; color: #4338ca; }
+            QMenu::item:disabled { color: #9ca3af; }
+            QMenu::separator { height: 1px; background: #e5e7eb; margin: 4px 8px; }
         """)
 
-        # Non-clickable header
         header = QAction("Assign to speaker", menu)
         font = header.font()
         font.setPointSize(11)
@@ -381,14 +489,13 @@ class MeetingDetailView(QWidget):
 
         transcript = self._transcript_text()
         model = self._settings.get("ollama_model", llm.DEFAULT_MODEL)
-        base_url = ollama_url
 
         if mode == "summary":
             target_edit = self._summary_edit
-            gen_func = lambda: llm.generate_summary(transcript, model, base_url)
+            gen_func = lambda: llm.generate_summary(transcript, model, ollama_url)
         else:
             target_edit = self._actions_edit
-            gen_func = lambda: llm.generate_action_items(transcript, model, base_url)
+            gen_func = lambda: llm.generate_action_items(transcript, model, ollama_url)
 
         target_edit.clear()
         self._summary_btn.setEnabled(False)
