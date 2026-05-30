@@ -19,14 +19,17 @@ class DiarizationEngine:
 
     def load(self) -> None:
         from pyannote.audio import Pipeline
+        from huggingface_hub import login as hf_login
         token = get_hf_token()
         if not token:
             raise RuntimeError(
                 "No HuggingFace token found. Add one in Settings to enable speaker diarization."
             )
+        # Authenticate globally so from_pretrained needs no token kwarg —
+        # avoids breaking changes across pyannote versions (3.x vs 4.x).
+        hf_login(token=token, add_to_git_credential=False)
         self._pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            token=token,
         )
 
     def diarize(self, wav_path: str) -> list[dict]:
