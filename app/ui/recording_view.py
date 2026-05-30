@@ -233,7 +233,21 @@ class RecordingView(QWidget):
 
     def _on_diarization_error(self, msg: str) -> None:
         self._set_status("Speaker detection failed")
-        QMessageBox.warning(self, "Speaker Detection Failed", msg)
+        # Show full traceback in a scrollable dialog so errors are diagnosable
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Speaker Detection Failed")
+        dlg.setMinimumSize(560, 320)
+        layout = QVBoxLayout(dlg)
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText(msg)
+        te.setStyleSheet("font-family: monospace; font-size: 11px;")
+        layout.addWidget(te)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        layout.addWidget(btns)
+        dlg.exec()
         if self._meeting_id:
             self.recording_saved.emit(self._meeting_id)
 

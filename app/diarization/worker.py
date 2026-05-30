@@ -1,3 +1,5 @@
+import traceback
+
 from PySide6.QtCore import QThread, Signal
 
 from .engine import DiarizationEngine
@@ -33,4 +35,5 @@ class DiarizationWorker(QThread):
             turns = engine.diarize(self._wav_path)
             self.diarization_complete.emit(turns)
         except Exception as exc:
-            self.error_occurred.emit(str(exc))
+            full = traceback.format_exc()
+            self.error_occurred.emit(full)
