@@ -33,9 +33,11 @@ class DiarizationEngine:
         """Returns list of {label, start, end} dicts sorted by start."""
         if self._pipeline is None:
             self.load()
-        diarization = self._pipeline(wav_path)
+        result = self._pipeline(wav_path)
+        # pyannote 4.x wraps the annotation in DiarizeOutput
+        annotation = getattr(result, "speaker_diarization", result)
         turns = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
             turns.append({"label": speaker, "start": turn.start, "end": turn.end})
         turns.sort(key=lambda t: t["start"])
         return turns
